@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>3DGS Viewer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0b0e; overflow: hidden; font-family: -apple-system, sans-serif; }
+  #container { width: 100%; height: 100%; }
+  #hint {
+    position: fixed; top: 12px; left: 12px; color: #ddd; background: rgba(0,0,0,0.5);
+    padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; z-index: 10;
+    pointer-events: none;
+  }
+  #dropzone {
+    position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+    background: rgba(30,120,255,0.15); border: 3px dashed rgba(120,170,255,0.8);
+    color: #fff; font-size: 22px; z-index: 20; pointer-events: none;
+  }
+  #dropzone.active { display: flex; }
+  #error {
+    position: fixed; top: 12px; right: 12px; max-width: 40%; color: #fff;
+    background: rgba(180,30,30,0.85); padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; display: none; z-index: 10;
+  }
+</style>
+</head>
+<body>
+  <div id="container"></div>
+  <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 回転 / 右ドラッグ: パン / ホイール: ズーム</div>
+  <div id="dropzone">ファイルをドロップして読み込み</div>
+  <div id="error"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "gaussian-splats-3d": "https://cdn.jsdelivr.net/npm/@mkkellogg/gaussian-splats-3d@0.4.7/build/gaussian-splats-3d.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+    import * as GaussianSplats3D from "gaussian-splats-3d";
+
+    const container = document.getElementById("container");
+    const dropzone = document.getElementById("dropzone");
+    const errorBox = document.getElementById("error");
+
+    function showError(msg) {
+      errorBox.textContent = msg;
+      errorBox.style.display = "block";
+      console.error(msg);
+    }
+
+    if (location.protocol === "file:") {
+      showError("file:// では動作しません。'python3 -m http.server' 等でローカルサーバ経由で開いてください。");
+    }
+
+    function createViewer() {
+      return new GaussianSplats3D.Viewer({
+        cameraUp: [0, -1, 0],
+        initialCameraPosition: [0, -2, 5],
+        initialCameraLookAt: [0, 0, 0],
+        rootElement: container,
+        selfDrivenMode: true,
+        useBuiltInControls: true,
+        sharedMemoryForWorkers: false,
+      });
+    }
+
+    let viewer = createViewer();
+    let sceneLoaded = false;
+
+    async function loadSplat(pathOrUrl) {
+      errorBox.style.display = "none";
+      // 2回目以降(ドラッグ&ドロップ)は既存シーンを破棄してから作り直す。
+      // 初回は生成直後のViewerをそのまま使う(dispose直後の再生成はWebGLコンテキスト
+      // 競合でcanvasが消えることがあるため避ける)。
+      if (sceneLoaded) {
+        await viewer.dispose();
+        viewer = createViewer();
+      }
+      sceneLoaded = true;
+      viewer
+        .addSplatScene(pathOrUrl, {
+          splatAlphaRemovalThreshold: 5,
+          showLoadingUI: true,
+        })
+        .then(() => viewer.start())
+        .catch((e) => showError("読み込みに失敗しました: " + e));
+    }
+
+    const params = new URLSearchParams(location.search);
+    const file = params.get("file");
+    if (file) {
+      loadSplat(file);
+    } else {
+      viewer.start();
+    }
+
+    // ドラッグ&ドロップ対応
+    ["dragenter", "dragover"].forEach((evt) =>
+      window.addEventListener(evt, (e) => {
+        e.preventDefault();
+        dropzone.classList.add("active");
+      })
+    );
+    ["dragleave", "drop"].forEach((evt) =>
+      window.addEventListener(evt, (e) => {
+        e.preventDefault();
+        if (evt === "dragleave" && e.target !== document.documentElement) return;
+        dropzone.classList.remove("active");
+      })
+    );
+    window.addEventListener("drop", (e) => {
+      e.preventDefault();
+      const f = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (!f) return;
+      if (!/\.(ply|splat|ksplat)$/i.test(f.name)) {
+        showError("対応形式は .ply / .splat / .ksplat です: " + f.name);
+        return;
+      }
+      const url = URL.createObjectURL(f);
+      loadSplat(url);
+    });
+  </script>
+</body>
+</html>

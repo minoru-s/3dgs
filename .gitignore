@@ -1,0 +1,19 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 3dgs-lab: 実行のたびに生成/取得される中間物・成果物・依存バイナリ
+3dgs-lab/input/*
+3dgs-lab/work/*
+3dgs-lab/output/*
+3dgs-lab/logs/*
+3dgs-lab/.tools/
+3dgs-lab/target/
+
+# 社内向けドキュメント(公開リポジトリには含めない)
+3dgs_pipeline_requirements.md
+3dgs-lab-colab/FIX_NOTES.md
