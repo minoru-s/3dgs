@@ -24,6 +24,12 @@
   #level-controls button { cursor: pointer; }
   #level-controls button:hover { background: #333a47; }
   #level-controls label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  #file-input { display: none; }
+  #load-status {
+    position: fixed; top: 62px; right: 12px; max-width: min(520px, 70vw);
+    color: #eef4ff; background: rgba(19, 50, 88, 0.9); padding: 8px 12px;
+    border-radius: 8px; font-size: 13px; line-height: 1.5; z-index: 11; display: none;
+  }
   #dropzone {
     position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
     background: rgba(30,120,255,0.15); border: 3px dashed rgba(120,170,255,0.8);
@@ -52,8 +58,11 @@
     </label>
     <button id="level-button" type="button">水平に戻す</button>
     <label><input id="yaw-only" type="checkbox"> 水平だけに固定</label>
+    <button id="open-file-button" type="button">ファイルを選ぶ</button>
+    <input id="file-input" type="file" accept=".ply,.splat,.ksplat" />
   </div>
   <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 左右旋回・上下チルト / 右ドラッグ: パン / ホイール: ズーム / H: 地面基準に戻す</div>
+  <div id="load-status" role="status" aria-live="polite"></div>
   <div id="dropzone">ファイルをドロップして読み込み</div>
   <div id="error"></div>
 
@@ -76,6 +85,15 @@
     const upAxisSelect = document.getElementById("up-axis");
     const levelButton = document.getElementById("level-button");
     const yawOnlyCheckbox = document.getElementById("yaw-only");
+    const openFileButton = document.getElementById("open-file-button");
+    const fileInput = document.getElementById("file-input");
+    const loadStatus = document.getElementById("load-status");
+
+    const FORMAT_BY_EXTENSION = {
+      ply: GaussianSplats3D.SceneFormat.Ply,
+      splat: GaussianSplats3D.SceneFormat.Splat,
+      ksplat: GaussianSplats3D.SceneFormat.KSplat,
+    };
 
     const UP_VECTORS = {
       "x+": [1, 0, 0], "x-": [-1, 0, 0],
@@ -90,7 +108,18 @@
     function showError(msg) {
       errorBox.textContent = msg;
       errorBox.style.display = "block";
+      loadStatus.style.display = "none";
       console.error(msg);
+    }
+
+    function formatFromName(name) {
+      const match = name.toLowerCase().match(/\.([^.?#]+)(?:[?#].*)?$/);
+      return match ? FORMAT_BY_EXTENSION[match[1]] : undefined;
+    }
+
+    function setLoadStatus(message) {
+      loadStatus.textContent = message;
+      loadStatus.style.display = message ? "block" : "none";
     }
 
     if (location.protocol === "file:") {
@@ -107,6 +136,9 @@
         selfDrivenMode: true,
         useBuiltInControls: true,
         sharedMemoryForWorkers: false,
+        // GitHub PagesではSharedArrayBuffer用のCOOP/COEPヘッダーを設定できない。
+        // ライブラリ推奨どおり、共有メモリ無効時はGPU sortも無効にする。
+        gpuAcceleratedSort: false,
       });
     }
 
@@ -161,8 +193,9 @@
       if (event.code === "KeyH") levelCamera();
     });
 
-    async function loadSplat(pathOrUrl) {
+    async function loadSplat(pathOrUrl, { format, label = "scene" } = {}) {
       errorBox.style.display = "none";
+      setLoadStatus(`読み込み中: ${label}`);
       // 2回目以降(ドラッグ&ドロップ)は既存シーンを破棄してから作り直す。
       // 初回は生成直後のViewerをそのまま使う(dispose直後の再生成はWebGLコンテキスト
       // 競合でcanvasが消えることがあるため避ける)。
@@ -171,26 +204,53 @@
         viewer = createViewer();
       }
       sceneLoaded = true;
-      viewer
-        .addSplatScene(pathOrUrl, {
-          splatAlphaRemovalThreshold: 5,
-          showLoadingUI: true,
-        })
-        .then(() => {
-          viewer.start();
-          updatePolarLimits();
-          levelCamera();
-        })
-        .catch((e) => showError("読み込みに失敗しました: " + e));
+      const sceneOptions = {
+        splatAlphaRemovalThreshold: 5,
+        showLoadingUI: true,
+      };
+      if (format !== undefined) sceneOptions.format = format;
+
+      try {
+        await viewer.addSplatScene(pathOrUrl, sceneOptions);
+        viewer.start();
+        updatePolarLimits();
+        levelCamera();
+        setLoadStatus(`読み込み完了: ${label}`);
+        window.setTimeout(() => setLoadStatus(""), 2500);
+      } catch (e) {
+        showError("読み込みに失敗しました: " + e);
+      }
+    }
+
+    async function loadLocalFile(file) {
+      if (!/\.(ply|splat|ksplat)$/i.test(file.name)) {
+        showError("対応形式は .ply / .splat / .ksplat です: " + file.name);
+        return;
+      }
+      const format = formatFromName(file.name);
+      const url = URL.createObjectURL(file);
+      const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+      try {
+        await loadSplat(url, { format, label: `${file.name} (${sizeMB} MB)` });
+      } finally {
+        URL.revokeObjectURL(url);
+      }
     }
 
     const params = new URLSearchParams(location.search);
     const file = params.get("file");
     if (file) {
-      loadSplat(file);
+      loadSplat(file, { format: formatFromName(file), label: file });
     } else {
       viewer.start();
     }
+
+    openFileButton.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", () => {
+      const file = fileInput.files && fileInput.files[0];
+      if (file) loadLocalFile(file);
+      fileInput.value = "";
+    });
 
     // ドラッグ&ドロップ対応
     ["dragenter", "dragover"].forEach((evt) =>
@@ -210,12 +270,7 @@
       e.preventDefault();
       const f = e.dataTransfer.files && e.dataTransfer.files[0];
       if (!f) return;
-      if (!/\.(ply|splat|ksplat)$/i.test(f.name)) {
-        showError("対応形式は .ply / .splat / .ksplat です: " + f.name);
-        return;
-      }
-      const url = URL.createObjectURL(f);
-      loadSplat(url);
+      loadLocalFile(f);
     });
   </script>
 </body>
