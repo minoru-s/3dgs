@@ -8,7 +8,7 @@
   html, body { margin: 0; height: 100%; background: #0b0b0e; overflow: hidden; font-family: -apple-system, sans-serif; }
   #container { width: 100%; height: 100%; }
   #hint {
-    position: fixed; top: 62px; left: 12px; color: #ddd; background: rgba(0,0,0,0.5);
+    position: fixed; top: 112px; left: 12px; color: #ddd; background: rgba(0,0,0,0.5);
     padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; z-index: 10;
     pointer-events: none;
   }
@@ -24,9 +24,23 @@
   #level-controls button { cursor: pointer; }
   #level-controls button:hover { background: #333a47; }
   #level-controls label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  #level-fine-controls {
+    position: fixed; top: 60px; left: 12px; display: flex; align-items: center; gap: 8px;
+    color: #eee; background: rgba(0,0,0,0.68); padding: 7px 10px; border-radius: 9px;
+    font-size: 12px; z-index: 12; backdrop-filter: blur(8px);
+  }
+  #level-fine-controls button {
+    color: #f4f4f4; background: #252932; border: 1px solid #555d6b; border-radius: 6px;
+    padding: 4px 7px; font: inherit; cursor: pointer;
+  }
+  #level-fine-controls button:hover { background: #333a47; }
+  #level-fine-controls button:disabled { opacity: 0.45; cursor: default; }
+  #level-fine-controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
+  #level-fine-controls input[type="range"] { width: 100px; }
+  #level-fine-controls output { min-width: 37px; text-align: right; font-variant-numeric: tabular-nums; }
   #file-input { display: none; }
   #load-status {
-    position: fixed; top: 62px; right: 12px; max-width: min(520px, 70vw);
+    position: fixed; top: 60px; right: 12px; max-width: min(520px, 70vw);
     color: #eef4ff; background: rgba(19, 50, 88, 0.9); padding: 8px 12px;
     border-radius: 8px; font-size: 13px; line-height: 1.5; z-index: 11; display: none;
   }
@@ -54,12 +68,27 @@
         <option value="y-">−Y</option>
         <option value="x+">+X</option>
         <option value="x-">−X</option>
+        <option value="custom" disabled>自動推定</option>
       </select>
     </label>
     <button id="level-button" type="button">水平に戻す</button>
     <label><input id="yaw-only" type="checkbox"> 水平だけに固定</label>
     <button id="open-file-button" type="button">ファイルを選ぶ</button>
     <input id="file-input" type="file" accept=".ply,.splat,.ksplat" />
+  </div>
+  <div id="level-fine-controls">
+    <button id="auto-level-button" type="button" disabled>床を自動推定</button>
+    <button id="cycle-axis-button" type="button" disabled>推定軸を変更</button>
+    <button id="flip-up-button" type="button">上下反転</button>
+    <label>左右補正
+      <input id="tilt-a" type="range" min="-45" max="45" value="0" step="0.5" />
+      <output id="tilt-a-value">0.0°</output>
+    </label>
+    <label>前後補正
+      <input id="tilt-b" type="range" min="-45" max="45" value="0" step="0.5" />
+      <output id="tilt-b-value">0.0°</output>
+    </label>
+    <button id="reset-tilt-button" type="button">微調整を戻す</button>
   </div>
   <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 左右旋回・上下チルト / 右ドラッグ: パン / ホイール: ズーム / H: 地面基準に戻す</div>
   <div id="load-status" role="status" aria-live="polite"></div>
@@ -88,6 +117,15 @@
     const openFileButton = document.getElementById("open-file-button");
     const fileInput = document.getElementById("file-input");
     const loadStatus = document.getElementById("load-status");
+    const customUpOption = upAxisSelect.querySelector('option[value="custom"]');
+    const autoLevelButton = document.getElementById("auto-level-button");
+    const cycleAxisButton = document.getElementById("cycle-axis-button");
+    const flipUpButton = document.getElementById("flip-up-button");
+    const tiltAInput = document.getElementById("tilt-a");
+    const tiltBInput = document.getElementById("tilt-b");
+    const tiltAValue = document.getElementById("tilt-a-value");
+    const tiltBValue = document.getElementById("tilt-b-value");
+    const resetTiltButton = document.getElementById("reset-tilt-button");
 
     const FORMAT_BY_EXTENSION = {
       ply: GaussianSplats3D.SceneFormat.Ply,
@@ -101,8 +139,23 @@
       "z+": [0, 0, 1], "z-": [0, 0, -1],
     };
 
+    let estimatedAxes = [];
+    let estimatedAxisIndex = 0;
+    let customBaseUp = null;
+    let lastLocalPly = null;
+
     function selectedUp() {
-      return new THREE.Vector3(...UP_VECTORS[upAxisSelect.value]).normalize();
+      const base = upAxisSelect.value === "custom" && customBaseUp
+        ? customBaseUp.clone()
+        : new THREE.Vector3(...UP_VECTORS[upAxisSelect.value]).normalize();
+      const reference = Math.abs(base.z) < 0.9
+        ? new THREE.Vector3(0, 0, 1)
+        : new THREE.Vector3(0, 1, 0);
+      const axisA = new THREE.Vector3().crossVectors(reference, base).normalize();
+      const axisB = new THREE.Vector3().crossVectors(base, axisA).normalize();
+      base.applyAxisAngle(axisA, THREE.MathUtils.degToRad(Number(tiltAInput.value)));
+      base.applyAxisAngle(axisB, THREE.MathUtils.degToRad(Number(tiltBInput.value)));
+      return base.normalize();
     }
 
     function showError(msg) {
@@ -120,6 +173,205 @@
     function setLoadStatus(message) {
       loadStatus.textContent = message;
       loadStatus.style.display = message ? "block" : "none";
+    }
+
+    const PLY_SCALAR_TYPES = {
+      char:    { bytes: 1, read: (view, offset) => view.getInt8(offset) },
+      int8:    { bytes: 1, read: (view, offset) => view.getInt8(offset) },
+      uchar:   { bytes: 1, read: (view, offset) => view.getUint8(offset) },
+      uint8:   { bytes: 1, read: (view, offset) => view.getUint8(offset) },
+      short:   { bytes: 2, read: (view, offset) => view.getInt16(offset, true) },
+      int16:   { bytes: 2, read: (view, offset) => view.getInt16(offset, true) },
+      ushort:  { bytes: 2, read: (view, offset) => view.getUint16(offset, true) },
+      uint16:  { bytes: 2, read: (view, offset) => view.getUint16(offset, true) },
+      int:     { bytes: 4, read: (view, offset) => view.getInt32(offset, true) },
+      int32:   { bytes: 4, read: (view, offset) => view.getInt32(offset, true) },
+      uint:    { bytes: 4, read: (view, offset) => view.getUint32(offset, true) },
+      uint32:  { bytes: 4, read: (view, offset) => view.getUint32(offset, true) },
+      float:   { bytes: 4, read: (view, offset) => view.getFloat32(offset, true) },
+      float32: { bytes: 4, read: (view, offset) => view.getFloat32(offset, true) },
+      double:  { bytes: 8, read: (view, offset) => view.getFloat64(offset, true) },
+      float64: { bytes: 8, read: (view, offset) => view.getFloat64(offset, true) },
+    };
+
+    function jacobiEigenvectors3(matrix) {
+      const a = matrix.map((row) => row.slice());
+      const vectors = [[1, 0, 0], [0, 1, 0], [0, 0, 1]];
+      for (let iteration = 0; iteration < 24; iteration += 1) {
+        let p = 0;
+        let q = 1;
+        if (Math.abs(a[0][2]) > Math.abs(a[p][q])) [p, q] = [0, 2];
+        if (Math.abs(a[1][2]) > Math.abs(a[p][q])) [p, q] = [1, 2];
+        if (Math.abs(a[p][q]) < 1e-12) break;
+
+        const angle = 0.5 * Math.atan2(2 * a[p][q], a[q][q] - a[p][p]);
+        const c = Math.cos(angle);
+        const s = Math.sin(angle);
+        const app = a[p][p];
+        const aqq = a[q][q];
+        const apq = a[p][q];
+
+        for (let i = 0; i < 3; i += 1) {
+          if (i === p || i === q) continue;
+          const aip = a[i][p];
+          const aiq = a[i][q];
+          a[i][p] = a[p][i] = c * aip - s * aiq;
+          a[i][q] = a[q][i] = s * aip + c * aiq;
+        }
+        a[p][p] = c * c * app - 2 * s * c * apq + s * s * aqq;
+        a[q][q] = s * s * app + 2 * s * c * apq + c * c * aqq;
+        a[p][q] = a[q][p] = 0;
+
+        for (let i = 0; i < 3; i += 1) {
+          const vip = vectors[i][p];
+          const viq = vectors[i][q];
+          vectors[i][p] = c * vip - s * viq;
+          vectors[i][q] = s * vip + c * viq;
+        }
+      }
+
+      return [0, 1, 2]
+        .map((index) => ({
+          value: a[index][index],
+          vector: [vectors[0][index], vectors[1][index], vectors[2][index]],
+        }))
+        .sort((left, right) => left.value - right.value);
+    }
+
+    function percentile(sortedValues, ratio) {
+      const index = Math.min(sortedValues.length - 1, Math.max(0, Math.floor((sortedValues.length - 1) * ratio)));
+      return sortedValues[index];
+    }
+
+    async function estimatePlyPrincipalAxes(file) {
+      const headerBytes = new Uint8Array(await file.slice(0, 256 * 1024).arrayBuffer());
+      const headerText = new TextDecoder("ascii").decode(headerBytes);
+      const endMarker = headerText.indexOf("end_header");
+      const headerEnd = endMarker >= 0 ? headerText.indexOf("\n", endMarker) + 1 : 0;
+      if (!headerEnd || !headerText.includes("format binary_little_endian 1.0")) {
+        throw new Error("自動水平はbinary little-endian PLYに対応しています");
+      }
+
+      let vertexCount = 0;
+      let inVertexElement = false;
+      let stride = 0;
+      const properties = {};
+      for (const rawLine of headerText.slice(0, headerEnd).split(/\r?\n/)) {
+        const parts = rawLine.trim().split(/\s+/);
+        if (parts[0] === "element") {
+          inVertexElement = parts[1] === "vertex";
+          if (inVertexElement) vertexCount = Number(parts[2]);
+          continue;
+        }
+        if (!inVertexElement || parts[0] !== "property") continue;
+        if (parts[1] === "list") throw new Error("可変長propertyを含むPLYには未対応です");
+        const scalar = PLY_SCALAR_TYPES[parts[1]];
+        if (!scalar) throw new Error(`未対応のPLY型: ${parts[1]}`);
+        properties[parts[2]] = { offset: stride, scalar };
+        stride += scalar.bytes;
+      }
+      if (!vertexCount || !stride || !properties.x || !properties.y || !properties.z) {
+        throw new Error("PLYの座標propertyを取得できませんでした");
+      }
+
+      const buffer = await file.arrayBuffer();
+      const view = new DataView(buffer);
+      const sampleStep = Math.max(1, Math.floor(vertexCount / 60000));
+      const xs = [];
+      const ys = [];
+      const zs = [];
+      for (let vertex = 0; vertex < vertexCount; vertex += sampleStep) {
+        const base = headerEnd + vertex * stride;
+        if (base + stride > view.byteLength) break;
+        const x = properties.x.scalar.read(view, base + properties.x.offset);
+        const y = properties.y.scalar.read(view, base + properties.y.offset);
+        const z = properties.z.scalar.read(view, base + properties.z.offset);
+        if (Number.isFinite(x) && Number.isFinite(y) && Number.isFinite(z)) {
+          xs.push(x); ys.push(y); zs.push(z);
+        }
+      }
+      if (xs.length < 100) throw new Error("水平推定に十分な点がありません");
+
+      const sortedX = xs.slice().sort((a, b) => a - b);
+      const sortedY = ys.slice().sort((a, b) => a - b);
+      const sortedZ = zs.slice().sort((a, b) => a - b);
+      const bounds = [
+        [percentile(sortedX, 0.01), percentile(sortedX, 0.99)],
+        [percentile(sortedY, 0.01), percentile(sortedY, 0.99)],
+        [percentile(sortedZ, 0.01), percentile(sortedZ, 0.99)],
+      ];
+
+      const points = [];
+      const mean = [0, 0, 0];
+      for (let i = 0; i < xs.length; i += 1) {
+        const point = [xs[i], ys[i], zs[i]];
+        if (point.some((value, axis) => value < bounds[axis][0] || value > bounds[axis][1])) continue;
+        points.push(point);
+        mean[0] += point[0]; mean[1] += point[1]; mean[2] += point[2];
+      }
+      mean[0] /= points.length; mean[1] /= points.length; mean[2] /= points.length;
+
+      const covariance = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
+      for (const point of points) {
+        const centered = [point[0] - mean[0], point[1] - mean[1], point[2] - mean[2]];
+        for (let row = 0; row < 3; row += 1) {
+          for (let column = row; column < 3; column += 1) {
+            covariance[row][column] += centered[row] * centered[column];
+          }
+        }
+      }
+      for (let row = 0; row < 3; row += 1) {
+        for (let column = row; column < 3; column += 1) {
+          covariance[row][column] /= Math.max(1, points.length - 1);
+          covariance[column][row] = covariance[row][column];
+        }
+      }
+      return jacobiEigenvectors3(covariance);
+    }
+
+    function resetTilt(updateCamera = true) {
+      tiltAInput.value = "0";
+      tiltBInput.value = "0";
+      tiltAValue.textContent = "0.0°";
+      tiltBValue.textContent = "0.0°";
+      if (updateCamera) levelCamera();
+    }
+
+    function applyEstimatedAxis(index, updateCamera = true) {
+      if (!estimatedAxes.length) return;
+      estimatedAxisIndex = ((index % estimatedAxes.length) + estimatedAxes.length) % estimatedAxes.length;
+      customBaseUp = estimatedAxes[estimatedAxisIndex].clone().normalize();
+      customUpOption.disabled = false;
+      customUpOption.textContent = `自動推定 ${estimatedAxisIndex + 1}/3`;
+      upAxisSelect.value = "custom";
+      resetTilt(false);
+      cycleAxisButton.disabled = false;
+      if (updateCamera) levelCamera();
+    }
+
+    async function autoLevelFromPly(file, updateCamera = true) {
+      autoLevelButton.disabled = true;
+      cycleAxisButton.disabled = true;
+      setLoadStatus(`床方向を推定中: ${file.name}`);
+      try {
+        const currentUp = selectedUp();
+        const eigensystem = await estimatePlyPrincipalAxes(file);
+        estimatedAxes = eigensystem.map(({ vector }) => {
+          const axis = new THREE.Vector3(...vector).normalize();
+          if (axis.dot(currentUp) < 0) axis.multiplyScalar(-1);
+          return axis;
+        });
+        applyEstimatedAxis(0, updateCamera);
+        setLoadStatus("床方向を自動推定しました。合わない場合は「推定軸を変更」または微調整を使ってください。");
+        return true;
+      } catch (error) {
+        console.warn(error);
+        setLoadStatus(`床方向を自動推定できませんでした: ${error.message}`);
+        return false;
+      } finally {
+        autoLevelButton.disabled = false;
+        cycleAxisButton.disabled = !estimatedAxes.length;
+      }
     }
 
     if (location.protocol === "file:") {
@@ -184,11 +436,37 @@
     }
 
     levelButton.addEventListener("click", levelCamera);
-    upAxisSelect.addEventListener("change", levelCamera);
+    upAxisSelect.addEventListener("change", () => {
+      if (upAxisSelect.value !== "custom") resetTilt(false);
+      levelCamera();
+    });
     yawOnlyCheckbox.addEventListener("change", () => {
       updatePolarLimits();
       if (yawOnlyCheckbox.checked) levelCamera();
     });
+    autoLevelButton.addEventListener("click", () => {
+      if (lastLocalPly) autoLevelFromPly(lastLocalPly);
+    });
+    cycleAxisButton.addEventListener("click", () => {
+      applyEstimatedAxis(estimatedAxisIndex + 1);
+    });
+    flipUpButton.addEventListener("click", () => {
+      if (upAxisSelect.value === "custom" && customBaseUp) {
+        customBaseUp.multiplyScalar(-1);
+      } else {
+        const opposite = { "x+": "x-", "x-": "x+", "y+": "y-", "y-": "y+", "z+": "z-", "z-": "z+" };
+        upAxisSelect.value = opposite[upAxisSelect.value];
+      }
+      levelCamera();
+    });
+    const updateTilt = () => {
+      tiltAValue.textContent = `${Number(tiltAInput.value).toFixed(1)}°`;
+      tiltBValue.textContent = `${Number(tiltBInput.value).toFixed(1)}°`;
+      levelCamera();
+    };
+    tiltAInput.addEventListener("input", updateTilt);
+    tiltBInput.addEventListener("input", updateTilt);
+    resetTiltButton.addEventListener("click", () => resetTilt());
     window.addEventListener("keydown", (event) => {
       if (event.code === "KeyH") levelCamera();
     });
@@ -228,6 +506,14 @@
         return;
       }
       const format = formatFromName(file.name);
+      if (/\.ply$/i.test(file.name)) {
+        lastLocalPly = file;
+        autoLevelButton.disabled = false;
+        await autoLevelFromPly(file, false);
+      } else {
+        lastLocalPly = null;
+        autoLevelButton.disabled = true;
+      }
       const url = URL.createObjectURL(file);
       const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
       try {
