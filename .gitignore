@@ -9,6 +9,16 @@ __pycache__/
 *.pyc
 .venv/
 
+# ローカル撮影データ・生成された3DGS成果物（配置場所に関係なく除外）
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.avi
+*.webm
+*.ply
+*.splat
+
 # 3dgs-lab: 実行のたびに生成/取得される中間物・成果物・依存バイナリ
 3dgs-lab/input/*
 3dgs-lab/work/*

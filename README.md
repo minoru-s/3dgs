@@ -7,7 +7,7 @@
 | ディレクトリ | 内容 | 状態 |
 |---|---|---|
 | [`3dgs-lab/`](3dgs-lab/) | macOSネイティブ版。[Brush](https://github.com/ArthurBrussee/brush)(wgpu/Metal) + [COLMAP](https://colmap.github.io/)(CPU)。CUDA不使用 | **メイン、稼働中** |
-| [`3dgs-lab-colab/`](3dgs-lab-colab/) | Google Colab版。[gsplat](https://github.com/nerfstudio-project/gsplat)(CUDA)で高速学習し、出力`.ply`は`3dgs-lab`のビューアで共用 | 一旦保留中 |
+| [`3dgs-lab-colab/`](3dgs-lab-colab/) | Google Colab版。CUDA PyCOLMAP + [gsplat](https://github.com/nerfstudio-project/gsplat)で高速化し、Google Driveへ段階保存 | **高速・永続保存版** |
 
 どちらも入出力は標準的な3DGS `.ply`形式で揃えてあるため、学習側だけ差し替えてビューアは共通で使えます。
 

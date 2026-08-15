@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -25,10 +26,11 @@ VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".avi", ".mkv"}
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
 PRESETS = {
-    # steps: 学習反復数 / long_edge: 画像長辺リサイズ(0=原寸) / max_splats: MCMCスプラット上限
-    "quick":    {"steps": 7000,  "long_edge": 1080, "max_splats": 1_000_000},
-    "standard": {"steps": 30000, "long_edge": 1600, "max_splats": 2_000_000},
-    "high":     {"steps": 45000, "long_edge": 0,    "max_splats": 3_000_000},
+    # frames: 動画から最終的に残すキーフレーム数
+    # steps: 学習反復数 / long_edge: 画像長辺 / max_splats: MCMCスプラット上限
+    "quick":    {"frames": 80,  "steps": 5000,  "long_edge": 1080, "max_splats": 350_000},
+    "standard": {"frames": 120, "steps": 10000, "long_edge": 1280, "max_splats": 600_000},
+    "high":     {"frames": 180, "steps": 20000, "long_edge": 1600, "max_splats": 1_200_000},
 }
 
 
@@ -43,12 +45,12 @@ class Logger:
         self._fh.write(line + "\n")
 
 
-def run(cmd, logger: Logger, **kwargs) -> subprocess.CompletedProcess:
+def run(cmd, logger: Logger, fail_on_error: bool = True, **kwargs) -> subprocess.CompletedProcess:
     logger.log("$ " + " ".join(str(c) for c in cmd))
     t0 = time.time()
     proc = subprocess.run(cmd, **kwargs)
     logger.log(f"  -> exit={proc.returncode} ({time.time() - t0:.1f}s)")
-    if proc.returncode != 0:
+    if proc.returncode != 0 and fail_on_error:
         raise SystemExit(f"コマンドが失敗しました: {' '.join(str(c) for c in cmd)}")
     return proc
 
@@ -101,6 +103,80 @@ def scale_filter_expr(long_edge: int) -> str:
     )
 
 
+def video_color_transfer(path: Path) -> str:
+    proc = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "stream=color_transfer",
+         "-of", "default=noprint_wrappers=1:nokey=1", str(path)],
+        capture_output=True, text=True,
+    )
+    return proc.stdout.strip().lower()
+
+
+def _thumbnail_metrics(path: Path):
+    from PIL import Image, ImageOps
+
+    with Image.open(path) as img:
+        gray = ImageOps.pad(img.convert("L"), (320, 320), color=0, method=Image.Resampling.BILINEAR)
+        sharpness = laplacian_variance(gray)
+    return sharpness, gray
+
+
+def _normalized(value: float, low: float, high: float) -> float:
+    if high <= low:
+        return 1.0
+    return max(0.0, min(1.0, (value - low) / (high - low)))
+
+
+def select_keyframes(candidate_dir: Path, images_dir: Path, target: int, logger: Logger):
+    """時間方向を均等に保ちつつ、各区間からブレが少なく変化量のある1枚を選ぶ。"""
+    from PIL import ImageChops, ImageStat
+
+    candidates = sorted(candidate_dir.glob("frame_*.jpg"))
+    if not candidates:
+        sys.exit("キーフレーム候補を1枚も抽出できませんでした。")
+
+    metrics = {path: _thumbnail_metrics(path) for path in candidates}
+    sharp_values = sorted(value[0] for value in metrics.values())
+    low = sharp_values[int(0.10 * (len(sharp_values) - 1))]
+    high = sharp_values[int(0.90 * (len(sharp_values) - 1))]
+    keep = min(target, len(candidates))
+    selected = []
+    previous_thumb = None
+
+    for bucket_index in range(keep):
+        start = round(bucket_index * len(candidates) / keep)
+        end = round((bucket_index + 1) * len(candidates) / keep)
+        bucket = candidates[start:max(start + 1, end)]
+        best = None
+        best_score = -1.0
+        for path in bucket:
+            sharpness, thumb = metrics[path]
+            sharp_score = _normalized(sharpness, low, high)
+            if previous_thumb is None:
+                motion_score = 0.5
+            else:
+                # RMS差分は厳密なオプティカルフローではないが、同じ短い時間区間内では
+                # 「ほぼ重複」と「適度に視点が動いたフレーム」を安価に区別できる。
+                rms = ImageStat.Stat(ImageChops.difference(previous_thumb, thumb)).rms[0]
+                motion_score = min(1.0, rms / 32.0)
+            score = 0.70 * sharp_score + 0.30 * motion_score
+            if score > best_score:
+                best, best_score = path, score
+        selected.append(best)
+        previous_thumb = metrics[best][1]
+
+    images_dir.mkdir(parents=True, exist_ok=True)
+    for index, source in enumerate(selected, start=1):
+        shutil.copy2(source, images_dir / f"frame_{index:05d}.jpg")
+
+    selected_sharpness = [metrics[path][0] for path in selected]
+    logger.log(
+        f"[extract] キーフレーム選別: {len(candidates)}候補 -> {len(selected)}枚 "
+        f"(時間均等 + シャープネス70% + 画面変化30%、sharpness中央値={statistics.median(selected_sharpness):.1f})"
+    )
+
+
 def stage_extract(input_path: Path, images_dir: Path, frames_target: int, long_edge: int, logger: Logger):
     logger.log(f"[extract] input={input_path} frames_target={frames_target} long_edge={long_edge or '原寸'}")
     if images_dir.exists():
@@ -108,6 +184,11 @@ def stage_extract(input_path: Path, images_dir: Path, frames_target: int, long_e
     images_dir.mkdir(parents=True)
 
     if is_video(input_path):
+        candidate_dir = images_dir.parent / "keyframe_candidates"
+        if candidate_dir.exists():
+            shutil.rmtree(candidate_dir)
+        candidate_dir.mkdir(parents=True)
+
         dur_proc = subprocess.run(
             ["ffprobe", "-v", "error", "-show_entries", "format=duration",
              "-of", "default=noprint_wrappers=1:nokey=1", str(input_path)],
@@ -119,31 +200,33 @@ def stage_extract(input_path: Path, images_dir: Path, frames_target: int, long_e
             duration = 0.0
         if duration <= 0:
             sys.exit(f"動画の長さを取得できませんでした: {input_path}")
-        fps = max(frames_target / duration, 0.1)
-        logger.log(f"[extract] duration={duration:.1f}s -> fps={fps:.4f}")
+        candidate_target = max(frames_target + 20, frames_target * 2)
+        fps = max(candidate_target / duration, 0.1)
+        logger.log(f"[extract] duration={duration:.1f}s -> 候補fps={fps:.4f} ({candidate_target}枚目標)")
 
         vf = f"fps={fps:.6f}"
+        transfer = video_color_transfer(input_path)
+        filters = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True,
+        ).stdout
+        if transfer in {"arib-std-b67", "smpte2084"} and "zscale" in filters:
+            vf += (
+                ",zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,"
+                "tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p"
+            )
+            logger.log(f"[extract] HDR({transfer})をSDRへトーンマッピングします")
+        elif transfer in {"arib-std-b67", "smpte2084"}:
+            logger.log(f"[extract] 警告: HDR({transfer})ですがffmpegにzscaleが無いため、そのまま変換します")
         if long_edge > 0:
             vf += "," + scale_filter_expr(long_edge)
         run(
-            ["ffmpeg", "-y", "-i", str(input_path), "-vf", vf, "-q:v", "2",
-             str(images_dir / "frame_%05d.jpg")],
+            ["ffmpeg", "-hide_banner", "-loglevel", "warning", "-y", "-i", str(input_path),
+             "-map_metadata", "-1", "-vf", vf, "-q:v", "2",
+             str(candidate_dir / "frame_%05d.jpg")],
             logger,
         )
-
-        # ブレ画像の簡易除去: シャープネス(ラプラシアン分散)下位10%を破棄
-        from PIL import Image
-        files = sorted(images_dir.glob("frame_*.jpg"))
-        if len(files) > 10:
-            scores = []
-            for f in files:
-                with Image.open(f) as img:
-                    scores.append((laplacian_variance(img), f))
-            scores.sort(key=lambda x: x[0])
-            n_drop = len(scores) // 10
-            for _, f in scores[:n_drop]:
-                f.unlink()
-            logger.log(f"[extract] ブレ画像 {n_drop} 枚を除去 ({len(files)} -> {len(files) - n_drop})")
+        select_keyframes(candidate_dir, images_dir, frames_target, logger)
+        shutil.rmtree(candidate_dir)
     else:
         # 画像フォルダ: リサイズしつつ images/ にコピー
         from PIL import Image, ImageOps
@@ -175,7 +258,7 @@ def stage_extract(input_path: Path, images_dir: Path, frames_target: int, long_e
 
 
 # ---------------------------------------------------------------------------
-# (b) sfm: COLMAP (CPUモード)
+# (b) sfm: COLMAP (MacではCPUモード)
 # ---------------------------------------------------------------------------
 
 SHOOTING_GUIDE = """
@@ -190,7 +273,24 @@ SHOOTING_GUIDE = """
 """
 
 
-def stage_sfm(is_video_scene: bool, work_dir: Path, images_dir: Path, logger: Logger, force: bool):
+def model_registered_images(model_dir: Path) -> int:
+    analyzer = subprocess.run(
+        ["colmap", "model_analyzer", "--path", str(model_dir)],
+        capture_output=True, text=True,
+    )
+    combined = analyzer.stdout + analyzer.stderr
+    match = re.search(r"Registered images:\s*(\d+)", combined)
+    return int(match.group(1)) if match else 0
+
+
+def best_sparse_model(root: Path):
+    models = [path for path in root.iterdir() if path.is_dir()] if root.exists() else []
+    scored = [(model_registered_images(path), path) for path in models]
+    return max(scored, default=(0, None), key=lambda item: item[0])
+
+
+def stage_sfm(is_video_scene: bool, work_dir: Path, images_dir: Path, logger: Logger,
+              force: bool, mapper_mode: str):
     db_path = work_dir / "colmap.db"
     sparse_dir = work_dir / "sparse"
     if db_path.exists():
@@ -199,14 +299,16 @@ def stage_sfm(is_video_scene: bool, work_dir: Path, images_dir: Path, logger: Lo
         shutil.rmtree(sparse_dir)
     sparse_dir.mkdir(parents=True)
 
-    logger.log("[sfm] feature_extractor 実行中(CPUモード)...")
+    logger.log("[sfm] feature_extractor 実行中(CPUモード、最大4096特徴)...")
     run(
         ["colmap", "feature_extractor",
          "--database_path", str(db_path),
          "--image_path", str(images_dir),
          "--ImageReader.single_camera", "1",
-         "--ImageReader.camera_model", "OPENCV",
-         "--FeatureExtraction.use_gpu", "0"],
+         "--ImageReader.camera_model", "SIMPLE_RADIAL",
+         "--FeatureExtraction.use_gpu", "0",
+         "--FeatureExtraction.max_image_size", "1600",
+         "--SiftExtraction.max_num_features", "4096"],
         logger,
     )
 
@@ -215,31 +317,62 @@ def stage_sfm(is_video_scene: bool, work_dir: Path, images_dir: Path, logger: Lo
     run(
         ["colmap", matcher,
          "--database_path", str(db_path),
-         "--FeatureMatching.use_gpu", "0"],
+         "--FeatureMatching.use_gpu", "0",
+         "--FeatureMatching.max_num_matches", "16384"]
+        + (["--SequentialMatching.overlap", "10",
+            "--SequentialMatching.quadratic_overlap", "1"] if is_video_scene else []),
         logger,
     )
 
-    logger.log("[sfm] mapper 実行中(疎再構成)...")
-    run(
-        ["colmap", "mapper",
-         "--database_path", str(db_path),
-         "--image_path", str(images_dir),
-         "--output_path", str(sparse_dir)],
-        logger,
-    )
-
-    model_dir = sparse_dir / "0"
-    if not model_dir.exists():
-        sys.exit("COLMAP の疎再構成に失敗しました(sparse/0 が生成されませんでした)。" + SHOOTING_GUIDE)
-
-    analyzer = subprocess.run(
-        ["colmap", "model_analyzer", "--path", str(model_dir)],
-        capture_output=True, text=True,
-    )
-    combined = analyzer.stdout + analyzer.stderr
-    m = re.search(r"Registered images:\s*(\d+)", combined)
-    registered = int(m.group(1)) if m else 0
     total = len(list(images_dir.glob("*.jpg")))
+    candidates = []
+
+    if mapper_mode == "global":
+        global_dir = work_dir / "sparse_global"
+        shutil.rmtree(global_dir, ignore_errors=True)
+        global_dir.mkdir(parents=True)
+        logger.log("[sfm] view graphを較正後、Global Mapperを実行します")
+        run(
+            ["colmap", "view_graph_calibrator", "--database_path", str(db_path)],
+            logger, fail_on_error=False,
+        )
+        proc = run(
+            ["colmap", "global_mapper",
+             "--database_path", str(db_path),
+             "--image_path", str(images_dir),
+             "--output_path", str(global_dir),
+             "--GlobalMapper.gp_use_gpu", "0",
+             "--GlobalMapper.ba_ceres_use_gpu", "0"],
+            logger, fail_on_error=False,
+        )
+        if proc.returncode == 0:
+            candidates.append(best_sparse_model(global_dir))
+
+    best_registered, best_model = max(candidates, default=(0, None), key=lambda item: item[0])
+    if mapper_mode == "incremental" or best_registered < max(3, math.ceil(total * 0.5)):
+        incremental_dir = work_dir / "sparse_incremental"
+        shutil.rmtree(incremental_dir, ignore_errors=True)
+        incremental_dir.mkdir(parents=True)
+        reason = "指定" if mapper_mode == "incremental" else f"Global Mapper登録率不足({best_registered}/{total})"
+        logger.log(f"[sfm] Incremental Mapperを実行します ({reason})")
+        proc = run(
+            ["colmap", "mapper",
+             "--database_path", str(db_path),
+             "--image_path", str(images_dir),
+             "--output_path", str(incremental_dir)],
+            logger, fail_on_error=False,
+        )
+        if proc.returncode == 0:
+            candidates.append(best_sparse_model(incremental_dir))
+
+    registered, best_model = max(candidates, default=(0, None), key=lambda item: item[0])
+    model_dir = sparse_dir / "0"
+    if best_model is None or registered == 0:
+        sys.exit("COLMAP の疎再構成に失敗しました(sparse/0 が生成されませんでした)。" + SHOOTING_GUIDE)
+    shutil.copytree(best_model, model_dir)
+    shutil.rmtree(work_dir / "sparse_global", ignore_errors=True)
+    shutil.rmtree(work_dir / "sparse_incremental", ignore_errors=True)
+
     ratio = registered / total if total else 0.0
     logger.log(f"[sfm] 登録画像数: {registered}/{total} ({ratio:.0%})")
 
@@ -324,13 +457,15 @@ def build_parser():
     p.add_argument("input", nargs="?", help=".mp4/.mov 動画、または画像フォルダ")
     p.add_argument("--name", help="シーン名(省略時は入力ファイル/フォルダ名)")
     p.add_argument("--preset", choices=list(PRESETS), default="standard")
-    p.add_argument("--frames", type=int, default=200, help="動画から抽出する目標フレーム数")
+    p.add_argument("--frames", type=int, default=None, help="動画から残すキーフレーム数(既定: プリセット依存)")
     p.add_argument("--long-edge", type=int, default=None, help="画像の長辺リサイズ(px)。0で原寸")
     p.add_argument("--only", choices=["extract", "sfm", "train", "view"], help="ステージ単体実行")
     p.add_argument("--view", action="store_true", help="学習後に自動でビューアを起動")
     p.add_argument("--force", action="store_true", help="SfM登録率が低くても続行する")
     p.add_argument("--steps", type=int, default=None, help="Brush学習ステップ数(プリセットを上書き)")
     p.add_argument("--max-splats", type=int, default=None, help="スプラット数上限(プリセットを上書き)")
+    p.add_argument("--mapper", choices=["global", "incremental"], default="global",
+                   help="COLMAPマッパー(既定global、登録率50%%未満ならincrementalへ自動フォールバック)")
     p.add_argument("--with-viewer", action="store_true", help="学習中にBrushのGUIを開く(デバッグ用)")
     p.add_argument("--port", type=int, default=8000, help="ビューア用HTTPサーバのポート")
     return p
@@ -344,6 +479,10 @@ def main():
     long_edge = args.long_edge if args.long_edge is not None else preset["long_edge"]
     steps = args.steps or preset["steps"]
     max_splats = args.max_splats or preset["max_splats"]
+    frames = args.frames or preset["frames"]
+
+    if frames <= 0 or steps <= 0 or max_splats <= 0 or long_edge < 0:
+        sys.exit("frames/steps/max-splats は正、long-edge は0以上を指定してください。")
 
     scene = resolve_scene(args)
     work_dir = WORK_DIR / scene
@@ -353,7 +492,8 @@ def main():
 
     logger.log(
         f"=== scene={scene} preset={args.preset} steps={steps} "
-        f"long_edge={long_edge or '原寸'} max_splats={max_splats} only={args.only or 'all'} ==="
+        f"frames={frames} long_edge={long_edge or '原寸'} max_splats={max_splats} "
+        f"mapper={args.mapper} only={args.only or 'all'} ==="
     )
 
     input_path = Path(args.input).expanduser().resolve() if args.input else None
@@ -368,7 +508,7 @@ def main():
     if run_extract:
         if input_path is None:
             sys.exit("extract ステージには入力(動画/画像フォルダ)が必要です。")
-        stage_extract(input_path, images_dir, args.frames, long_edge, logger)
+        stage_extract(input_path, images_dir, frames, long_edge, logger)
 
     if run_sfm:
         if input_path is None and not images_dir.exists():
@@ -380,7 +520,7 @@ def main():
             is_video_scene = json.loads(meta_path.read_text())["is_video"]
         else:
             sys.exit(f"{meta_path} が見つかりません。--only extract を先に実行するか入力を指定してください。")
-        stage_sfm(is_video_scene, work_dir, images_dir, logger, args.force)
+        stage_sfm(is_video_scene, work_dir, images_dir, logger, args.force, args.mapper)
 
     if run_train:
         stage_train(work_dir, output_dir, scene, steps, max_splats, long_edge, args.with_viewer, logger)

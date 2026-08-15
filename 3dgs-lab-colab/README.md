@@ -11,32 +11,41 @@
 1. `colab_pipeline.ipynb` を [Google Colab](https://colab.research.google.com/) で開く(アップロードするか、GitHub経由で開く)
 2. メニュー **ランタイム > ランタイムのタイプを変更** で **GPU** (T4など)を選択
 3. 上から順にセルを実行:
-   - セットアップ(COLMAP/ffmpeg/gsplat導入)
-   - 設定(シーン名、フレーム数、解像度、ステップ数、スプラット上限)
+   - GPU確認（CPUランタイムなら即停止）
+   - 設定とGoogle Driveの書き込み検証
+   - セットアップ(CUDA PyCOLMAP/ffmpeg/gsplat導入)
    - 動画 or 画像のアップロード
-   - フレーム抽出 → COLMAP(SfM) → gsplat学習(CUDA)
-   - `.ply` のダウンロード
-4. ダウンロードした `.ply` を `3dgs-lab/viewer/index.html` にドラッグ&ドロップして見る
+   - 有効キーフレーム選別 → GPU SfM → 軽量gsplat学習
+   - Drive上の `.ply` とmanifestを検証（ブラウザダウンロードは任意）
+4. Driveから取得した `.ply` を `3dgs-lab/viewer/index.html` にドラッグ&ドロップして見る
    (または `3dgs-lab/output/<シーン名>/<シーン名>.ply` に置いて `python3 splat.py --name <シーン名> --only view`)
 
 ## ローカル版との対応
 
 | ローカル版(splat.py) | Colab版 |
 |---|---|
-| `--preset` | ノートブック内の設定セル(FRAMES_TARGET/LONG_EDGE/MAX_STEPS/CAP_MAX_SPLATS) |
+| `--preset` | `PROFILE` (`quick` / `balanced` / `quality`) |
 | Brush(wgpu/Metal) | gsplat(CUDA、`mcmc`戦略 = Brushの`--max-splats`と同じMCMC方式) |
-| COLMAP CPUモード | COLMAP(Colab上、CPUビルド。SfMは全体の数%なのでボトルネックにならない) |
+| COLMAP CPUモード | `pycolmap-cuda12`（SIFT抽出・照合をGPU化、Global Mapper） |
 | `viewer/index.html` | 同じものをそのまま使用 |
 
-既定値(速さ重視): 200フレーム・長辺1600px・15,000ステップ・スプラット上限150万。
-Colab Pro/Pro+でより強いGPU(A100等)が使えるなら、ステップ数や解像度を上げても十分な速度が出るはずです。
+推奨の `balanced`: 120キーフレーム・長辺1280px・8,000ステップ・スプラット上限60万・SH degree 2。
+前回のT4実測（旧設定）は86分でしたが、旧設定はSfMをCPUで動かし、15,000ステップの多くを約150万Gaussianで処理していました。新設定の目標は **20〜35分程度** です。ただしGPU割当、撮影内容、登録率、Drive速度で変動し、まだ同一動画での完走実測前です。
+
+### Driveに残るもの
+
+各実行は `MyDrive/3dgs-lab/<scene>/<scene>_<実行時刻>/` に保存されます。
+
+- `selected_images.zip`: 選別済み画像。動画を再アップロードせず再開可能
+- `sfm_checkpoint.zip`: `sparse/0` のカメラ姿勢・疎点群
+- `sfm_manifest.json`: 登録枚数と登録率
+- `ply/point_cloud_*.ply`: 学習中間点と最終成果物
+- `result_manifest.json`: 設定、サイズ、SHA-256、学習時間
 
 ## 注意・既知の制約
 
-- **このノートブックはgsplat公式ソース(README/`examples/simple_trainer.py`)を読んで作成したもので、
-  実際にColabのGPUランタイム上で最後まで実行検証はできていません**(Claude CodeはColab実行環境に
-  直接アクセスできないため)。`pip install`まわりでエラーが出た場合は内容を教えてください。
+- ノートブックのJSON・全Pythonセルの構文とローカル側CLIは検証済みです。CUDA版PyCOLMAP 4.1.1のAPIに合わせていますが、新しい高速経路は同一動画・T4での完走実測前です。
 - 無料版ColabのT4はセッション時間制限・切断があります。長時間の学習は要注意。
-- アップロードした動画/画像やCOLMAPの中間生成物はColabのセッション終了とともに消えます。
-  必要なら `.ply` だけでなく `sparse/` 等も明示的にダウンロード/Driveに保存してください。
+- 元のアップロード動画だけはランタイム上の一時データです（元動画はMacにある前提）。その後の再開可能な中間物とPLYはDriveに段階保存されます。
+- `balanced` は4,000 stepにもPLYを保存します。4,000 stepより前にランタイム自体が失われた場合でも、選別画像とSfMチェックポイントは残ります。
 - 撮影ガイド・トラブルシュートは [3dgs-lab/README.md](../3dgs-lab/README.md) を参照してください(共通)。

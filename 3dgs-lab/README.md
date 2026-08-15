@@ -2,7 +2,7 @@
 
 スマホ等で撮影した**動画または複数枚の静止画**から、[Brush](https://github.com/ArthurBrussee/brush) と [COLMAP](https://colmap.github.io/) を使って macOS ネイティブ（Apple Silicon / Metal）で 3D Gaussian Splatting のシーンを再構成し、ブラウザのローカルビューアでインタラクティブに閲覧するためのパイプラインです。
 
-CUDA は使いません。学習は Brush（wgpu/Metal）、SfM（カメラ姿勢推定）は COLMAP の CPU モードで行います。
+CUDA は使いません。学習は Brush（wgpu/Metal）、SfM（カメラ姿勢推定）は COLMAP の CPU モードで行います。動画は一度多めに候補を抽出し、時間範囲を保ちながらブレと重複の少ないキーフレームへ絞ります。
 
 ## 0. 必要環境
 
@@ -46,26 +46,34 @@ python3 splat.py <input> [options]
   <input>            .mp4/.mov 動画、または画像フォルダ
   --name NAME        シーン名(省略時は入力ファイル/フォルダ名)
   --preset {quick,standard,high}   既定 standard
-  --frames N         動画から抽出する目標フレーム数(既定 200)
+  --frames N         動画から残すキーフレーム数(既定: プリセット依存)
   --long-edge PX     画像の長辺リサイズ(既定: プリセット依存。0で原寸)
   --only {extract,sfm,train,view}  ステージ単体実行
   --view             学習後に自動でビューアを起動
   --force            SfM登録率が低くても続行する
   --steps N          Brush学習ステップ数(プリセットを上書き)
   --max-splats N     スプラット数上限(プリセットを上書き)
+  --mapper {global,incremental}  既定 global。登録率不足時は自動フォールバック
   --with-viewer      学習中にBrushのGUIを開く(デバッグ用)
   --port PORT        ビューア用HTTPサーバのポート(既定 8000)
 ```
 
 ### プリセット
 
-| preset | 反復数 | 長辺 | スプラット上限 | 想定用途 |
-|---|---|---|---|---|
-| quick | 7,000 | 1080 | 100万 | 撮影の良否確認(10〜20分目安) |
-| standard | 30,000 | 1600 | 200万 | 通常利用 |
-| high | 45,000 | 原寸 | 300万 | 最終出力(メモリ16GBなら上限に注意) |
+| preset | キーフレーム | 反復数 | 長辺 | スプラット上限 | 想定用途 |
+|---|---:|---:|---:|---:|---|
+| quick | 80 | 5,000 | 1080 | 35万 | 撮影・形状確認 |
+| standard | 120 | 10,000 | 1280 | 60万 | 通常利用（推奨） |
+| high | 180 | 20,000 | 1600 | 120万 | 品質優先 |
 
-1M スプラット ≈ 2GB メモリが目安です。メモリが厳しい場合は `--max-splats` を下げてください。
+1M スプラット ≈ 2GB メモリが目安です。従来の `standard`（30,000 step・200万上限）はM2/16GBには重すぎたため、既定値を実測に基づき下げています。メモリが厳しい場合は `--max-splats` をさらに下げてください。
+
+### 軽量化の仕組み
+
+- 動画から目標枚数の約2倍を候補抽出し、各時間区間から「シャープネス70% + 画面変化30%」で1枚を選びます。撮影全体を残したまま、ブレとほぼ同一のフレームを減らします。
+- カメラモデルは過剰な自由度を避けた `SIMPLE_RADIAL`、SIFTは最大4,096特徴、動画の照合は隣接10枚 + 二次間隔です。
+- COLMAP 4.1のGlobal Mapperを先に使い、登録率50%未満または失敗時だけ従来のIncremental Mapperへフォールバックします。
+- HDR/HLG/PQ動画は、ffmpegに`zscale`があればSDRへトーンマッピングしてから処理します。
 
 ### ステージ単体実行
 
@@ -122,7 +130,8 @@ python3 splat.py --name myscene --only view
 - **COLMAP の登録画像数が少ない(50%未満で停止)**: ほぼ撮影起因です。上の撮影ガイドを見直してください。撮影をやり直さずに強行したい場合は `--force` を付けられますが品質は保証されません。
 - **`brush_app` が開けない(Gatekeeper)**: 上記「Gatekeeper 警告について」を参照。
 - **メモリ不足で学習が落ちる**: `--max-splats` や `--long-edge` を下げて再実行してください(自動フォールバックはありません)。
-- **画像300枚超で COLMAP が急に遅くなる**: COLMAP は CPU 実行のため画像数に対して非線形に遅くなります。既定の 200枚 程度に抑えることを推奨します。
+- **画像枚数を増やすと COLMAP が急に遅くなる**: COLMAP は CPU 実行のため画像数に対して非線形に遅くなります。まず `standard` の120枚で登録率を確認してください。
+- **Global Mapperで登録できない**: 既定では登録率50%未満になるとIncremental Mapperを自動実行します。最初から従来方式を使う場合は `--mapper incremental` を指定できます。
 - **Safari で表示が乱れる/真っ黒**: Chrome で開き直してください。
 - **HEIC / Live Photo**: `input/` には `.mp4`/`.mov` などの動画、または `.jpg`/`.png` 等の画像フォルダを置いてください。HEIC 画像は macOS 標準の `sips -s format jpeg in.heic --out out.jpg` などで事前に JPEG へ変換してください。
 
