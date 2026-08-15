@@ -18,6 +18,7 @@ __pycache__/
 *.webm
 *.ply
 *.splat
+*.ksplat
 
 # 3dgs-lab: 実行のたびに生成/取得される中間物・成果物・依存バイナリ
 3dgs-lab/input/*
