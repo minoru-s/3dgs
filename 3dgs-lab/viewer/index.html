@@ -8,10 +8,22 @@
   html, body { margin: 0; height: 100%; background: #0b0b0e; overflow: hidden; font-family: -apple-system, sans-serif; }
   #container { width: 100%; height: 100%; }
   #hint {
-    position: fixed; top: 12px; left: 12px; color: #ddd; background: rgba(0,0,0,0.5);
+    position: fixed; top: 62px; left: 12px; color: #ddd; background: rgba(0,0,0,0.5);
     padding: 8px 12px; border-radius: 8px; font-size: 13px; line-height: 1.5; z-index: 10;
     pointer-events: none;
   }
+  #level-controls {
+    position: fixed; top: 12px; left: 12px; display: flex; align-items: center; gap: 8px;
+    color: #eee; background: rgba(0,0,0,0.68); padding: 8px 10px; border-radius: 9px;
+    font-size: 13px; z-index: 12; backdrop-filter: blur(8px);
+  }
+  #level-controls select, #level-controls button {
+    color: #f4f4f4; background: #252932; border: 1px solid #555d6b; border-radius: 6px;
+    padding: 5px 8px; font: inherit;
+  }
+  #level-controls button { cursor: pointer; }
+  #level-controls button:hover { background: #333a47; }
+  #level-controls label { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
   #dropzone {
     position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
     background: rgba(30,120,255,0.15); border: 3px dashed rgba(120,170,255,0.8);
@@ -27,7 +39,21 @@
 </head>
 <body>
   <div id="container"></div>
-  <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 回転 / 右ドラッグ: パン / ホイール: ズーム</div>
+  <div id="level-controls">
+    <label>上方向
+      <select id="up-axis" aria-label="上方向">
+        <option value="z+" selected>+Z（通常）</option>
+        <option value="z-">−Z</option>
+        <option value="y+">+Y</option>
+        <option value="y-">−Y</option>
+        <option value="x+">+X</option>
+        <option value="x-">−X</option>
+      </select>
+    </label>
+    <button id="level-button" type="button">水平に戻す</button>
+    <label><input id="yaw-only" type="checkbox"> 水平だけに固定</label>
+  </div>
+  <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 左右旋回・上下チルト / 右ドラッグ: パン / ホイール: ズーム / H: 地面基準に戻す</div>
   <div id="dropzone">ファイルをドロップして読み込み</div>
   <div id="error"></div>
 
@@ -41,11 +67,25 @@
   </script>
 
   <script type="module">
+    import * as THREE from "three";
     import * as GaussianSplats3D from "gaussian-splats-3d";
 
     const container = document.getElementById("container");
     const dropzone = document.getElementById("dropzone");
     const errorBox = document.getElementById("error");
+    const upAxisSelect = document.getElementById("up-axis");
+    const levelButton = document.getElementById("level-button");
+    const yawOnlyCheckbox = document.getElementById("yaw-only");
+
+    const UP_VECTORS = {
+      "x+": [1, 0, 0], "x-": [-1, 0, 0],
+      "y+": [0, 1, 0], "y-": [0, -1, 0],
+      "z+": [0, 0, 1], "z-": [0, 0, -1],
+    };
+
+    function selectedUp() {
+      return new THREE.Vector3(...UP_VECTORS[upAxisSelect.value]).normalize();
+    }
 
     function showError(msg) {
       errorBox.textContent = msg;
@@ -59,9 +99,10 @@
 
     function createViewer() {
       return new GaussianSplats3D.Viewer({
-        cameraUp: [0, -1, 0],
-        initialCameraPosition: [0, -2, 5],
-        initialCameraLookAt: [0, 0, 0],
+        // gsplatのCOLMAP正規化後はZ+が上方向。従来のY-指定だと床が回転軸になる。
+        cameraUp: selectedUp().toArray(),
+        initialCameraPosition: [0, -3.2, 1.1],
+        initialCameraLookAt: [0, 0, 0.45],
         rootElement: container,
         selfDrivenMode: true,
         useBuiltInControls: true,
@@ -71,6 +112,54 @@
 
     let viewer = createViewer();
     let sceneLoaded = false;
+
+    function updatePolarLimits() {
+      // Google Mapsの3D表示に近く、真上からほぼ水平までは動かせるが、
+      // 床の下へ潜って上下が反転する角度には入れない。
+      const nearHorizon = Math.PI / 2 - 0.03;
+      const min = yawOnlyCheckbox.checked ? nearHorizon : 0.08;
+      const max = nearHorizon;
+      [viewer.perspectiveControls, viewer.orthographicControls].forEach((controls) => {
+        if (!controls) return;
+        controls.minPolarAngle = min;
+        controls.maxPolarAngle = max;
+      });
+    }
+
+    function levelCamera() {
+      if (!viewer.camera || !viewer.controls) return;
+      const up = selectedUp();
+      const target = viewer.controls.target.clone();
+      const offset = viewer.camera.position.clone().sub(target);
+      const distance = Math.max(offset.length(), 0.1);
+
+      // 現在の方角は保ち、高さ成分だけ除いて視線を床と平行にする。
+      const horizontal = offset.clone().addScaledVector(up, -offset.dot(up));
+      if (horizontal.lengthSq() < 1e-8) {
+        horizontal.set(0, -1, 0);
+        if (Math.abs(horizontal.dot(up)) > 0.9) horizontal.set(1, 0, 0);
+        horizontal.addScaledVector(up, -horizontal.dot(up));
+      }
+      horizontal.normalize().multiplyScalar(distance);
+
+      viewer.camera.up.copy(up);
+      viewer.camera.position.copy(target).add(horizontal);
+      viewer.camera.lookAt(target);
+      updatePolarLimits();
+      viewer.controls.target.copy(target);
+      viewer.controls.update();
+      viewer.forceRenderNextFrame();
+    }
+
+    levelButton.addEventListener("click", levelCamera);
+    upAxisSelect.addEventListener("change", levelCamera);
+    yawOnlyCheckbox.addEventListener("change", () => {
+      updatePolarLimits();
+      if (yawOnlyCheckbox.checked) levelCamera();
+    });
+    window.addEventListener("keydown", (event) => {
+      if (event.code === "KeyH") levelCamera();
+    });
 
     async function loadSplat(pathOrUrl) {
       errorBox.style.display = "none";
@@ -87,7 +176,11 @@
           splatAlphaRemovalThreshold: 5,
           showLoadingUI: true,
         })
-        .then(() => viewer.start())
+        .then(() => {
+          viewer.start();
+          updatePolarLimits();
+          levelCamera();
+        })
         .catch((e) => showError("読み込みに失敗しました: " + e));
     }
 
