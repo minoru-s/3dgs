@@ -1,0 +1,223 @@
+diff --git a/arguments/__init__.py b/arguments/__init__.py
+index 52888ae..9515d44 100755
+--- a/arguments/__init__.py
++++ b/arguments/__init__.py
+@@ -99,6 +99,17 @@ class OptimizationParams(ParamGroup):
+         self.dense = 0.001
+         self.mult = 0.5      # multiplier for the compact box to control the tile number of each splat
+
++        # Robust casual-video mode. Disabled by default so the pinned upstream
++        # presets remain bit-for-bit compatible unless explicitly requested.
++        self.robust_mode = False
++        self.robust_abs_floor = 0.025
++        self.robust_mad_scale = 3.0
++        self.robust_quantile = 0.88
++        self.robust_min_error_views = 3
++        self.robust_min_visible_views = 3
++        self.robust_min_view_ratio = 0.4
++        self.robust_sh_milestones = "2000,5000,8000"
++
+         self.random_background = False
+         self.optimizer_type = "default"
+         super().__init__(parser, "Optimization Parameters")
+diff --git a/train.py b/train.py
+index 0cf7e1f..ee5d764 100755
+--- a/train.py
++++ b/train.py
+@@ -62,6 +62,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+     progress_bar = tqdm(range(first_iter, opt.iterations), desc="Training progress")
+     first_iter += 1
+     bg = torch.rand((3), device="cuda") if opt.random_background else background
++    robust_sh_milestones = {
++        int(value) for value in opt.robust_sh_milestones.split(",") if value
++    }
+
+     for iteration in range(first_iter, opt.iterations + 1):
+
+@@ -77,8 +80,13 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+
+         gaussians.update_learning_rate(iteration)
+
+-        # Every 1000 its we increase the levels of SH up to a maximum degree
+-        if iteration % 1000 == 0:
++        # Casual phone video benefits from stabilising geometry before fitting
++        # high-order, view-dependent colour. Upstream behaviour is unchanged
++        # unless robust_mode is selected.
++        if opt.robust_mode:
++            if iteration in robust_sh_milestones:
++                gaussians.oneupSHdegree()
++        elif iteration % 1000 == 0:
+             gaussians.oneupSHdegree()
+
+         # Pick a random Camera
+@@ -132,7 +140,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
+                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
+                     my_viewpoint_stack = scene.getTrainCameras().copy()
+-                    camlist = sampling_cameras(my_viewpoint_stack)
++                    camlist = sampling_cameras(my_viewpoint_stack, robust=opt.robust_mode)
+
+                     # The multiview consistent densification of fastgs
+                     importance_score, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt, DENSIFY=True)
+@@ -152,7 +160,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
+             # You can check the rendering results of 20K iterations in arxiv version (https://arxiv.org/abs/2511.04283), the rendering quality is already very good.
+             if iteration % 3000 == 0 and iteration > 15_000 and iteration < 30_000:
+                 my_viewpoint_stack = scene.getTrainCameras().copy()
+-                camlist = sampling_cameras(my_viewpoint_stack)
++                camlist = sampling_cameras(my_viewpoint_stack, robust=opt.robust_mode)
+
+                 _, pruning_score = compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, opt)
+                 gaussians.final_prune_fastgs(min_opacity = 0.1, pruning_score = pruning_score)
+diff --git a/utils/fast_utils.py b/utils/fast_utils.py
+index 2fbe9e7..c13a19d 100755
+--- a/utils/fast_utils.py
++++ b/utils/fast_utils.py
+@@ -7,10 +7,33 @@ import torchvision.transforms as transforms
+ import random
+
+
+-def sampling_cameras(my_viewpoint_stack):
++_pose_sample_round = 0
++
++
++def sampling_cameras(my_viewpoint_stack, robust=False):
+     ''' Randomly sample a given number of cameras from the viewpoint stack'''
+
+-    num_cams = 10
++    num_cams = min(10, len(my_viewpoint_stack))
++    if robust:
++        # Farthest-point sampling over camera centres covers the capture path
++        # with the same render budget as upstream's ten random cameras. Rotate
++        # the seed so intermediate viewpoints also participate over time.
++        global _pose_sample_round
++        centres = torch.stack([
++            camera.camera_center.detach().float().cpu()
++            for camera in my_viewpoint_stack
++        ])
++        seed = (_pose_sample_round * 17) % len(my_viewpoint_stack)
++        _pose_sample_round += 1
++        chosen = [seed]
++        min_distance = torch.full((len(my_viewpoint_stack),), float("inf"))
++        for _ in range(1, num_cams):
++            distance = torch.sum((centres - centres[chosen[-1]]) ** 2, dim=1)
++            min_distance = torch.minimum(min_distance, distance)
++            min_distance[chosen] = -1
++            chosen.append(int(torch.argmax(min_distance)))
++        return [my_viewpoint_stack[index] for index in chosen]
++
+     camlist = []
+     for _ in range(num_cams):
+         loc = random.randint(0, len(my_viewpoint_stack) - 1)
+@@ -24,6 +47,38 @@ def get_loss(reconstructed_image, original_image):
+
+     return l1_loss_norm
+
++
++def get_robust_loss(reconstructed_image, original_image, args):
++    """Return an absolute, exposure-tolerant high-error mask.
++
++    Upstream min-max normalization always creates near-one residuals, even for
++    low-amplitude sensor noise. We estimate one global luminance affine change,
++    then combine an absolute floor, a robust MAD threshold, and a high quantile.
++    Statistics use a 4x subsample; the full-resolution mask is still returned.
++    """
++    reconstructed = reconstructed_image.detach()
++    original = original_image.detach()
++    rec_sample = reconstructed[:, ::4, ::4]
++    gt_sample = original[:, ::4, ::4]
++    rec_luma = rec_sample.mean(dim=0)
++    gt_luma = gt_sample.mean(dim=0)
++    rec_mean, gt_mean = rec_luma.mean(), gt_luma.mean()
++    rec_std = rec_luma.std().clamp_min(1e-4)
++    gt_std = gt_luma.std().clamp_min(1e-4)
++    gain = torch.clamp(gt_std / rec_std, 0.8, 1.25)
++    bias = torch.clamp(gt_mean - gain * rec_mean, -0.08, 0.08)
++    aligned = torch.clamp(gain * reconstructed + bias, 0.0, 1.0)
++    residual = torch.mean(torch.abs(aligned - original), dim=0)
++    sample = residual[::4, ::4].reshape(-1)
++    median = torch.median(sample)
++    mad = torch.median(torch.abs(sample - median)).clamp_min(1e-6)
++    robust_threshold = median + args.robust_mad_scale * 1.4826 * mad
++    quantile_threshold = torch.quantile(sample, args.robust_quantile)
++    absolute_floor = residual.new_tensor(args.robust_abs_floor)
++    threshold = torch.maximum(absolute_floor,
++                              torch.maximum(robust_threshold, quantile_threshold))
++    return residual, (residual > threshold).int()
++
+ def compute_photometric_loss(viewpoint_cam, image):
+     gt_image = viewpoint_cam.original_image.cuda()
+     Ll1 = l1_loss(image, gt_image)
+@@ -69,6 +124,8 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY =
+
+     full_metric_counts = None
+     full_metric_score = None
++    error_view_hits = None
++    visible_view_hits = None
+
+     for view in range(len(camlist)):
+         my_viewpoint_cam = camlist[view]
+@@ -77,14 +134,26 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY =
+
+         gt_image = my_viewpoint_cam.original_image.cuda()
+         get_flag = True
+-        l1_loss_norm = get_loss(render_image, gt_image)
+-
+-        metric_map = (l1_loss_norm > args.loss_thresh).int()
++        if args.robust_mode:
++            _, metric_map = get_robust_loss(render_image, gt_image, args)
++        else:
++            l1_loss_norm = get_loss(render_image, gt_image)
++            metric_map = (l1_loss_norm > args.loss_thresh).int()
+
+         render_pkg = render_fastgs(my_viewpoint_cam, gaussians, pipe, bg, args.mult, get_flag = get_flag, metric_map = metric_map)
+
+         accum_loss_counts = render_pkg["accum_metric_counts"]
+
++        if args.robust_mode:
++            per_view_error = accum_loss_counts > 0
++            per_view_visible = render_pkg["radii"] > 0
++            if error_view_hits is None:
++                error_view_hits = per_view_error.int()
++                visible_view_hits = per_view_visible.int()
++            else:
++                error_view_hits += per_view_error.int()
++                visible_view_hits += per_view_visible.int()
++
+         if DENSIFY:
+             if full_metric_counts is None:
+                 full_metric_counts = accum_loss_counts.clone()
+@@ -96,10 +165,32 @@ def compute_gaussian_score_fastgs(camlist, gaussians, pipe, bg, args, DENSIFY =
+         else:
+             full_metric_score += photometric_loss * accum_loss_counts
+
+-    pruning_score = (full_metric_score - torch.min(full_metric_score)) / (torch.max(full_metric_score) - torch.min(full_metric_score))
++    score_min, score_max = torch.min(full_metric_score), torch.max(full_metric_score)
++    pruning_score = (full_metric_score - score_min) / (score_max - score_min).clamp_min(1e-8)
++
++    if args.robust_mode:
++        visible = visible_view_hits.clamp_min(1)
++        view_ratio = error_view_hits.float() / visible.float()
++        consensus = torch.logical_and(
++            error_view_hits >= args.robust_min_error_views,
++            visible_view_hits >= args.robust_min_visible_views,
++        )
++        consensus = torch.logical_and(consensus,
++                                      view_ratio >= args.robust_min_view_ratio)
++        # Protect sparsely observed spatial regions from photometric pruning.
++        pruning_score = pruning_score * consensus.float()
+
+     if DENSIFY:
+-        importance_score = torch.div(full_metric_counts, len(camlist), rounding_mode='floor')
++        if args.robust_mode:
++            # gaussian_model.py uses >5 as its existing gate. Preserve that
++            # interface while changing the decision to distinct-view consensus.
++            importance_score = torch.where(
++                consensus,
++                torch.full_like(full_metric_counts, 6),
++                torch.zeros_like(full_metric_counts),
++            )
++        else:
++            importance_score = torch.div(full_metric_counts, len(camlist), rounding_mode='floor')
+     else:
+         importance_score = None
+     return importance_score, pruning_score
