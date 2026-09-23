@@ -2,7 +2,7 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8" />
-<title>3DGS Viewer</title>
+<title>3DGS Viewer — 表示比較</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <style>
   html, body { margin: 0; height: 100%; background: #0b0b0e; overflow: hidden; font-family: -apple-system, sans-serif; }
@@ -38,6 +38,41 @@
   #level-fine-controls label { display: flex; align-items: center; gap: 4px; white-space: nowrap; }
   #level-fine-controls input[type="range"] { width: 100px; }
   #level-fine-controls output { min-width: 37px; text-align: right; font-variant-numeric: tabular-nums; }
+  #clean-panel {
+    position: fixed; top: 112px; right: 12px; width: min(330px, calc(100vw - 24px));
+    color: #eee; background: rgba(9, 12, 18, 0.82); border: 1px solid rgba(116, 132, 160, 0.45);
+    border-radius: 10px; font-size: 12px; z-index: 12; backdrop-filter: blur(10px);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  }
+  #clean-panel summary {
+    display: flex; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 9px 11px; cursor: pointer; font-size: 13px; font-weight: 650; list-style: none;
+  }
+  #clean-panel summary::-webkit-details-marker { display: none; }
+  #clean-panel summary::after { content: "▾"; color: #aebbd0; transition: transform 0.15s ease; }
+  #clean-panel:not([open]) summary::after { transform: rotate(-90deg); }
+  #clean-panel-body { border-top: 1px solid rgba(116, 132, 160, 0.32); padding: 10px 11px 11px; }
+  #clean-presets { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; margin-bottom: 10px; }
+  #clean-panel button, #clean-panel select {
+    color: #f4f4f4; background: #252932; border: 1px solid #555d6b; border-radius: 6px;
+    padding: 5px 7px; font: inherit;
+  }
+  #clean-panel button { cursor: pointer; }
+  #clean-panel button:hover { background: #333a47; }
+  #clean-panel button:disabled { opacity: 0.45; cursor: default; }
+  #clean-presets button.active { color: #fff; background: #245aa8; border-color: #5b91df; }
+  .clean-row {
+    display: grid; grid-template-columns: minmax(112px, 1fr) 118px 42px; align-items: center;
+    gap: 7px; min-height: 30px;
+  }
+  .clean-row input[type="range"] { width: 118px; }
+  .clean-row output { text-align: right; color: #dce7f7; font-variant-numeric: tabular-nums; }
+  .clean-row select { width: 100%; }
+  .clean-check { display: flex; align-items: center; gap: 6px; min-height: 30px; }
+  #clean-actions { display: flex; align-items: center; gap: 7px; margin-top: 9px; }
+  #apply-clean-button { flex: 1; background: #245aa8 !important; border-color: #5b91df !important; }
+  #clean-dirty { color: #ffd47a; white-space: nowrap; }
+  #clean-note { margin-top: 8px; color: #aeb8c8; line-height: 1.45; }
   #file-input { display: none; }
   #load-status {
     position: fixed; top: 60px; right: 12px; max-width: min(520px, 70vw);
@@ -54,6 +89,11 @@
     position: fixed; top: 12px; right: 12px; max-width: 40%; color: #fff;
     background: rgba(180,30,30,0.85); padding: 10px 14px; border-radius: 8px;
     font-size: 13px; display: none; z-index: 10;
+  }
+  @media (max-width: 760px) {
+    #level-controls, #level-fine-controls { max-width: calc(100vw - 24px); overflow-x: auto; }
+    #clean-panel { top: auto; bottom: 12px; }
+    #hint { display: none; }
   }
 </style>
 </head>
@@ -90,6 +130,45 @@
     </label>
     <button id="reset-tilt-button" type="button">微調整を戻す</button>
   </div>
+  <details id="clean-panel" open>
+    <summary>表示比較 <span id="clean-summary">今回向け</span></summary>
+    <div id="clean-panel-body">
+      <div id="clean-presets" aria-label="表示プリセット">
+        <button type="button" data-clean-preset="standard">従来表示</button>
+        <button type="button" data-clean-preset="clean" class="active">今回向け</button>
+        <button type="button" data-clean-preset="strong">薄い点を減らす</button>
+      </div>
+      <label class="clean-row" for="alpha-threshold">
+        <span>薄い点を隠す</span>
+        <input id="alpha-threshold" type="range" min="1" max="48" value="5" step="1" />
+        <output id="alpha-threshold-value">5</output>
+      </label>
+      <label class="clean-row" for="kernel-size">
+        <span>にじみの細さ</span>
+        <input id="kernel-size" type="range" min="0.10" max="0.60" value="0.30" step="0.02" />
+        <output id="kernel-size-value">0.30</output>
+      </label>
+      <label class="clean-row" for="sh-degree">
+        <span>角度による色</span>
+        <select id="sh-degree">
+          <option value="0">なし</option>
+          <option value="1">少なめ</option>
+          <option value="2" selected>多め</option>
+        </select>
+        <output></output>
+      </label>
+      <label class="clean-check">
+        <input id="clean-antialias" type="checkbox" checked /> 学習時の輪郭補正に合わせる
+      </label>
+      <div id="clean-actions">
+        <button id="apply-clean-button" type="button">表示に適用</button>
+        <span id="clean-dirty" hidden>未適用</span>
+      </div>
+      <button id="save-view-button" type="button" style="margin-top:10px;width:100%">この視点を保存</button>
+      <div id="clean-note">プリセットは同じ視点で切り替わります。PLYは変更しません。「薄い点を減らす」は細部も消す場合があります。形状の崩れを直す機能ではありません。</div>
+      <div style="margin-top:6px;color:#aeb8c8;font-size:11px">表示比較版 · 2026-09-23</div>
+    </div>
+  </details>
   <div id="hint">.ply / .splat / .ksplat をドラッグ&amp;ドロップ、または <code>?file=</code> で指定<br>左ドラッグ: 左右旋回・上下チルト / 右ドラッグ: パン / ホイール: ズーム / H: 地面基準に戻す</div>
   <div id="load-status" role="status" aria-live="polite"></div>
   <div id="dropzone">ファイルをドロップして読み込み</div>
@@ -126,6 +205,16 @@
     const tiltAValue = document.getElementById("tilt-a-value");
     const tiltBValue = document.getElementById("tilt-b-value");
     const resetTiltButton = document.getElementById("reset-tilt-button");
+    const cleanSummary = document.getElementById("clean-summary");
+    const cleanPresetButtons = [...document.querySelectorAll("[data-clean-preset]")];
+    const alphaThresholdInput = document.getElementById("alpha-threshold");
+    const alphaThresholdValue = document.getElementById("alpha-threshold-value");
+    const kernelSizeInput = document.getElementById("kernel-size");
+    const kernelSizeValue = document.getElementById("kernel-size-value");
+    const shDegreeSelect = document.getElementById("sh-degree");
+    const antialiasCheckbox = document.getElementById("clean-antialias");
+    const applyCleanButton = document.getElementById("apply-clean-button");
+    const cleanDirty = document.getElementById("clean-dirty");
 
     const FORMAT_BY_EXTENSION = {
       ply: GaussianSplats3D.SceneFormat.Ply,
@@ -139,10 +228,58 @@
       "z+": [0, 0, 1], "z-": [0, 0, -1],
     };
 
+    const CLEAN_PRESETS = {
+      standard: { label: "従来表示", alpha: 5, kernel: 0.30, sh: 0, antialias: false },
+      clean: { label: "今回向け", alpha: 5, kernel: 0.30, sh: 2, antialias: true },
+      strong: { label: "薄い点を減らす", alpha: 16, kernel: 0.30, sh: 2, antialias: true },
+    };
+
     let estimatedAxes = [];
     let estimatedAxisIndex = 0;
     let customBaseUp = null;
     let lastLocalPly = null;
+    let currentSceneSource = null;
+    let isLoadingScene = false;
+
+    function cleanSettingsFromControls() {
+      return {
+        alpha: Number(alphaThresholdInput.value),
+        kernel: Number(kernelSizeInput.value),
+        sh: Number(shDegreeSelect.value),
+        antialias: antialiasCheckbox.checked,
+      };
+    }
+
+    let appliedCleanSettings = cleanSettingsFromControls();
+
+    function matchingCleanPreset(settings = cleanSettingsFromControls()) {
+      return Object.entries(CLEAN_PRESETS).find(([, preset]) =>
+        preset.alpha === settings.alpha &&
+        Math.abs(preset.kernel - settings.kernel) < 1e-6 &&
+        preset.sh === settings.sh &&
+        preset.antialias === settings.antialias
+      )?.[0] || null;
+    }
+
+    function updateCleanControls({ dirty = true } = {}) {
+      const settings = cleanSettingsFromControls();
+      alphaThresholdValue.textContent = String(settings.alpha);
+      kernelSizeValue.textContent = settings.kernel.toFixed(2);
+      const presetKey = matchingCleanPreset(settings);
+      cleanPresetButtons.forEach((button) => button.classList.toggle("active", button.dataset.cleanPreset === presetKey));
+      cleanSummary.textContent = presetKey ? CLEAN_PRESETS[presetKey].label : "カスタム";
+      cleanDirty.hidden = !dirty;
+    }
+
+    function selectCleanPreset(key) {
+      const preset = CLEAN_PRESETS[key];
+      if (!preset) return;
+      alphaThresholdInput.value = String(preset.alpha);
+      kernelSizeInput.value = String(preset.kernel);
+      shDegreeSelect.value = String(preset.sh);
+      antialiasCheckbox.checked = preset.antialias;
+      updateCleanControls({ dirty: true });
+    }
 
     function selectedUp() {
       const base = upAxisSelect.value === "custom" && customBaseUp
@@ -380,7 +517,7 @@
 
     function createViewer() {
       return new GaussianSplats3D.Viewer({
-        // gsplatのCOLMAP正規化後はZ+が上方向。従来のY-指定だと床が回転軸になる。
+        // 上方向は撮影データに依存するため、選択・推定した軸を使う。
         cameraUp: selectedUp().toArray(),
         initialCameraPosition: [0, -3.2, 1.1],
         initialCameraLookAt: [0, 0, 0.45],
@@ -391,6 +528,11 @@
         // GitHub PagesではSharedArrayBuffer用のCOOP/COEPヘッダーを設定できない。
         // ライブラリ推奨どおり、共有メモリ無効時はGPU sortも無効にする。
         gpuAcceleratedSort: false,
+        // 表示だけを調整し、元のPLYやGaussianの座標は変更しない。
+        kernel2DSize: appliedCleanSettings.kernel,
+        // このライブラリの描画対応はSH次数2まで。公式SH3との完全一致ではない。
+        sphericalHarmonicsDegree: appliedCleanSettings.sh,
+        antialiased: appliedCleanSettings.antialias,
       });
     }
 
@@ -472,31 +614,79 @@
     });
 
     async function loadSplat(pathOrUrl, { format, label = "scene" } = {}) {
+      if (isLoadingScene) return;
+      isLoadingScene = true;
+      applyCleanButton.disabled = true;
+      cleanPresetButtons.forEach((button) => button.disabled = true);
       errorBox.style.display = "none";
       setLoadStatus(`読み込み中: ${label}`);
-      // 2回目以降(ドラッグ&ドロップ)は既存シーンを破棄してから作り直す。
-      // 初回は生成直後のViewerをそのまま使う(dispose直後の再生成はWebGLコンテキスト
-      // 競合でcanvasが消えることがあるため避ける)。
-      if (sceneLoaded) {
-        await viewer.dispose();
-        viewer = createViewer();
-      }
-      sceneLoaded = true;
-      const sceneOptions = {
-        splatAlphaRemovalThreshold: 5,
-        showLoadingUI: true,
-      };
-      if (format !== undefined) sceneOptions.format = format;
-
+      let previousView = null;
       try {
+        // 2回目以降はViewer設定も反映するため作り直す。dispose直後に生成すると
+        // 古い後処理が新しいcanvasまで消すことがあるため、2フレーム待って分離する。
+        if (sceneLoaded) {
+          if (viewer.camera && viewer.controls) {
+            previousView = {
+              position: viewer.camera.position.clone(),
+              up: viewer.camera.up.clone(),
+              target: viewer.controls.target.clone(),
+            };
+          }
+          await viewer.dispose();
+          await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+          // GaussianSplats3D 0.4.7のdispose()は、渡したrootElementもbodyから外す。
+          // 同じ表示領域を再利用できるよう、Viewer生成前にDOMへ戻す。
+          if (!container.isConnected) document.body.insertBefore(container, document.body.firstChild);
+          container.replaceChildren();
+          viewer = createViewer();
+        }
+        sceneLoaded = true;
+        const sceneOptions = {
+          splatAlphaRemovalThreshold: appliedCleanSettings.alpha,
+          showLoadingUI: true,
+        };
+        if (format !== undefined) sceneOptions.format = format;
+
         await viewer.addSplatScene(pathOrUrl, sceneOptions);
         viewer.start();
         updatePolarLimits();
-        levelCamera();
+        if (previousView && viewer.camera && viewer.controls) {
+          viewer.camera.position.copy(previousView.position);
+          viewer.camera.up.copy(previousView.up);
+          viewer.controls.target.copy(previousView.target);
+          viewer.camera.lookAt(previousView.target);
+          viewer.controls.update();
+          viewer.forceRenderNextFrame();
+        } else {
+          levelCamera();
+        }
         setLoadStatus(`読み込み完了: ${label}`);
         window.setTimeout(() => setLoadStatus(""), 2500);
       } catch (e) {
         showError("読み込みに失敗しました: " + e);
+      } finally {
+        isLoadingScene = false;
+        applyCleanButton.disabled = false;
+        cleanPresetButtons.forEach((button) => button.disabled = false);
+      }
+    }
+
+    async function reloadCurrentScene() {
+      if (!currentSceneSource) {
+        setLoadStatus("設定しました。次に読み込むファイルから適用されます。");
+        window.setTimeout(() => setLoadStatus(""), 2500);
+        return;
+      }
+
+      if (currentSceneSource.kind === "local") {
+        const url = URL.createObjectURL(currentSceneSource.file);
+        try {
+          await loadSplat(url, currentSceneSource.options);
+        } finally {
+          URL.revokeObjectURL(url);
+        }
+      } else {
+        await loadSplat(currentSceneSource.url, currentSceneSource.options);
       }
     }
 
@@ -514,19 +704,73 @@
         lastLocalPly = null;
         autoLevelButton.disabled = true;
       }
-      const url = URL.createObjectURL(file);
       const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-      try {
-        await loadSplat(url, { format, label: `${file.name} (${sizeMB} MB)` });
-      } finally {
-        URL.revokeObjectURL(url);
-      }
+      currentSceneSource = {
+        kind: "local",
+        file,
+        options: { format, label: `${file.name} (${sizeMB} MB)` },
+      };
+      await reloadCurrentScene();
     }
+
+    [alphaThresholdInput, kernelSizeInput].forEach((input) =>
+      input.addEventListener("input", () => updateCleanControls({ dirty: true }))
+    );
+    [shDegreeSelect, antialiasCheckbox].forEach((input) =>
+      input.addEventListener("change", () => updateCleanControls({ dirty: true }))
+    );
+    async function applyDisplaySettings() {
+      if (isLoadingScene) return;
+      appliedCleanSettings = cleanSettingsFromControls();
+      updateCleanControls({ dirty: false });
+      await reloadCurrentScene();
+    }
+    cleanPresetButtons.forEach((button) =>
+      button.addEventListener("click", async () => {
+        selectCleanPreset(button.dataset.cleanPreset);
+        await applyDisplaySettings();
+      })
+    );
+    applyCleanButton.addEventListener("click", applyDisplaySettings);
+    document.getElementById("save-view-button").addEventListener("click", () => {
+      if (!viewer.camera || !viewer.controls || !currentSceneSource || isLoadingScene) {
+        setLoadStatus("モデルの読み込みが終わってから視点を保存してください。");
+        return;
+      }
+      // 入力画像やPLYを送信せず、公式描画との照合に必要なカメラ情報だけを保存。
+      const camera = viewer.camera;
+      camera.updateMatrixWorld(true);
+      const rect = viewer.renderer.domElement.getBoundingClientRect();
+      const pose = {
+        version: 1, coordinates: "threejs_world_camera_minus_z",
+        model: currentSceneSource.kind === "local" ? currentSceneSource.file.name : "url-loaded-model",
+        position: camera.position.toArray(), quaternion: camera.quaternion.toArray(),
+        up: camera.up.toArray(), target: viewer.controls.target.toArray(),
+        cameraType: camera.type, fov: camera.fov, aspect: camera.aspect,
+        near: camera.near, far: camera.far,
+        worldMatrixColumnMajor: camera.matrixWorld.toArray(),
+        projectionMatrixColumnMajor: camera.projectionMatrix.toArray(),
+        viewport: {width: rect.width, height: rect.height},
+        display: {...appliedCleanSettings},
+      };
+      const url = URL.createObjectURL(new Blob([JSON.stringify(pose, null, 2)], {type: "application/json"}));
+      const a = document.createElement("a");
+      a.href = url; a.download = "3dgs-view.json"; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setLoadStatus("視点を保存しました。モデル自体は含まれません。");
+      setTimeout(() => setLoadStatus(""), 2500);
+    });
+    updateCleanControls({ dirty: false });
 
     const params = new URLSearchParams(location.search);
     const file = params.get("file");
     if (file) {
-      loadSplat(file, { format: formatFromName(file), label: file });
+      currentSceneSource = {
+        kind: "remote",
+        url: file,
+        options: { format: formatFromName(file), label: file },
+      };
+      reloadCurrentScene();
     } else {
       viewer.start();
     }
